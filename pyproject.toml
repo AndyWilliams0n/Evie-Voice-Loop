@@ -16,4 +16,5 @@ dependencies = [
     "soundfile>=0.12",     # TTS audio I/O
     "pyobjc-framework-AVFoundation>=11.0",  # macOS VoiceProcessingIO (AEC)
     "pyobjc-framework-CoreAudio>=11.0",     # macOS audio device access
+    "textual>=3.0",        # TUI (default on, --no-tui falls back to console)
 ]
