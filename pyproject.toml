@@ -10,9 +10,10 @@ dependencies = [
     "onnxruntime>=1.17",
     "mlx-vlm>=0.4.3",
     "moonshine-voice>=0.0.40,<0.0.55",  # 0.0.55 has no macOS arm64 wheel
-    "livekit>=1.1.5",
     "transformers>=4.40",  # used by smart-turn (default on)
     "torch>=2.0",          # used by silero-vad (pulled in transitively but declared explicitly)
     "kokoro-onnx>=0.4",    # TTS (default on)
     "soundfile>=0.12",     # TTS audio I/O
+    "pyobjc-framework-AVFoundation>=11.0",  # macOS VoiceProcessingIO (AEC)
+    "pyobjc-framework-CoreAudio>=11.0",     # macOS audio device access
 ]

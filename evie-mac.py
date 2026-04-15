@@ -2,23 +2,25 @@
 """Voice Loop — a minimal on-device voice agent. Mac M4 / Apple Silicon.
 
 Moonshine (CPU) transcribes speech. Gemma 4 E4B (Metal) responds.
-Kokoro TTS speaks the response. WebRTC AEC3 enables voice interrupt.
+Kokoro TTS speaks the response. macOS VoiceProcessingIO enables voice interrupt.
 
 Usage:
-    uv run voice_loop_mac.py                        # defaults (TTS + smart turn + AEC)
+    uv run voice_loop_mac.py                        # defaults (TTS + smart turn + VPIO)
     uv run voice_loop_mac.py --no-tts               # text out only
-    uv run voice_loop_mac.py --no-aec               # keypress interrupt only
+    uv run voice_loop_mac.py --no-vpio              # keypress interrupt only
     uv run voice_loop_mac.py --chime-loop           # chime + ticks while generating
 """
 
 import argparse
-import asyncio
 import os
 import queue
+import random
+import re
 import select
 import sys
 import tempfile
 import termios
+import threading
 import time as _time
 import tty
 import wave
@@ -27,9 +29,6 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-# Larger audio buffer via 'high' latency → more robust to MLX CPU saturation.
-# NB: don't set sd.default.blocksize globally — a large blocksize on the TTS
-# output stream introduces a mic-to-reference delay that misaligns AEC.
 sd.default.latency = 'high'
 import torch
 
@@ -38,6 +37,80 @@ CHUNK_SAMPLES = 512  # 32ms at 16kHz (required by Silero VAD)
 MAX_HISTORY = 10
 CHIME_SR = 24000
 _DIR = Path(__file__).parent
+
+FILLERS = {
+    'thinking': ["Hmm...", "That's a good question...", "Let me think..."],
+    'acknowledge': ["Sure...", "Okay...", "Right...", "Well..."],
+}
+
+
+class VPIOMic:
+    """macOS VoiceProcessingIO mic input via AVAudioEngine.
+    Apple's built-in AEC + noise suppression — the OS captures the speaker
+    output internally, so echo cancellation stays perfectly aligned with
+    zero manual reference tracking.  Delivers 16 kHz mono float32 chunks."""
+
+    def __init__(self, chunk_samples: int, audio_q: queue.Queue, record_buf: list | None = None):
+        import AVFoundation as AVF
+
+        self._AVF = AVF
+        self._engine = AVF.AVAudioEngine.alloc().init()
+        self._inp = self._engine.inputNode()
+        self._chunk_samples = chunk_samples
+        self._audio_q = audio_q
+        self._record_buf = record_buf
+        self._residual = np.empty(0, dtype=np.float32)
+
+        ok, err = self._inp.setVoiceProcessingEnabled_error_(True, None)
+        if not ok:
+            raise RuntimeError(f"Failed to enable VoiceProcessingIO: {err}")
+
+        self._native_sr = self._inp.outputFormatForBus_(0).sampleRate()
+
+    def start(self):
+        def _tap(buf, when):
+            try:
+                n = buf.frameLength()
+                if n == 0:
+                    return
+
+                fcd = buf.floatChannelData()
+                if fcd is None:
+                    return
+
+                raw = np.array(fcd[0][:n], dtype=np.float32)
+
+                if self._native_sr != SAMPLE_RATE:
+                    target_len = int(len(raw) * SAMPLE_RATE / self._native_sr)
+                    raw = np.interp(
+                        np.linspace(0, len(raw) - 1, target_len),
+                        np.arange(len(raw)),
+                        raw,
+                    ).astype(np.float32)
+
+                if self._record_buf is not None:
+                    self._record_buf.append(raw.copy())
+
+                combined = np.concatenate([self._residual, raw]) if len(self._residual) > 0 else raw
+                pos = 0
+
+                while pos + self._chunk_samples <= len(combined):
+                    self._audio_q.put(combined[pos:pos + self._chunk_samples].copy())
+                    pos += self._chunk_samples
+
+                self._residual = combined[pos:].copy() if pos < len(combined) else np.empty(0, dtype=np.float32)
+            except Exception:
+                pass
+
+        buf_size = int(self._native_sr * 0.032)
+        self._inp.installTapOnBus_bufferSize_format_block_(0, buf_size, None, _tap)
+        ok, err = self._engine.startAndReturnError_(None)
+        if not ok:
+            raise RuntimeError(f"AVAudioEngine failed to start: {err}")
+
+    def stop(self):
+        self._engine.stop()
+        self._inp.removeTapOnBus_(0)
 
 
 def load_system_prompt(include_memory: bool = False) -> str:
@@ -117,23 +190,21 @@ def _vad_prob(vad, chunk):
     p = vad(torch.from_numpy(chunk), SAMPLE_RATE)
     return p.item() if hasattr(p, "item") else p
 
-def _get_ref_segment(tts_concat, pos, length):
-    if pos >= len(tts_concat):
-        return np.zeros(length, dtype=np.float32)
-    seg = tts_concat[pos:pos + length]
-    return np.concatenate([seg, np.zeros(length - len(seg), dtype=np.float32)]) if len(seg) < length else seg
-
-
 def main():
     ap = argparse.ArgumentParser(description="Evie — your personal voice assistant (Mac)")
     B = argparse.BooleanOptionalAction
     ap.add_argument("--tts", action=B, default=True, help="Kokoro TTS output")
     ap.add_argument("--smart-turn", action=B, default=True, help="Smart Turn v3 endpoint detection")
-    ap.add_argument("--aec", action=B, default=True, help="WebRTC AEC3 voice interrupt")
+    ap.add_argument("--vpio", action=B, default=True,
+                    help="macOS VoiceProcessingIO echo cancellation (voice interrupt)")
     ap.add_argument("--chime", action=B, default=False,
                     help="Chime on utterance + soft ticks while generating")
     ap.add_argument("--memory", action="store_true",
                     help="Read/write MEMORY.md (auto-update durable facts, consolidate every 5 turns)")
+    ap.add_argument("--filler", action=B, default=True,
+                    help="Filler phrases during LLM prefill")
+    ap.add_argument("--sentence-gap-ms", type=int, default=80,
+                    help="Natural gap between streamed sentences (ms)")
     ap.add_argument("--audio-mode", action="store_true", help="Send audio directly to Gemma (experimental)")
     ap.add_argument("--model", default="mlx-community/gemma-4-E4B-it-4bit")
     ap.add_argument("--silence-ms", type=int, default=700)
@@ -155,7 +226,7 @@ def main():
     ms_path, ms_arch = get_model_for_language("en")
     moonshine = Transcriber(model_path=str(ms_path), model_arch=ms_arch)
     print(f"Loading {args.model} (first run downloads ~3GB)...", flush=True)
-    from mlx_vlm import load, generate
+    from mlx_vlm import load, generate, stream_generate
     model, processor = load(args.model)
     smart_turn = load_smart_turn() if args.smart_turn else None
     kokoro = None
@@ -184,41 +255,45 @@ def main():
             urllib.request.urlretrieve(f"{base}/voices-v1.0.bin", voices_file)
         kokoro = Kokoro(model_file, voices_file)
 
-    make_aec_processor = None
-    if args.aec:
-        from livekit.rtc import AudioFrame
-        from livekit.rtc.apm import AudioProcessingModule
-        WF = 160  # 10ms @ 16kHz
-        def _to_i16(x):
-            s = (x * 32767).clip(-32768, 32767).astype(np.int16)
-            return np.pad(s, (0, max(0, WF - len(s)))) if len(s) < WF else s
-        def _frame(b):
-            return AudioFrame(b.tobytes(), sample_rate=SAMPLE_RATE, num_channels=1, samples_per_channel=WF)
-        def make_aec_processor():
-            apm = AudioProcessingModule(echo_cancellation=True, noise_suppression=True)
-            def process(mic, ref):
-                cleaned = np.zeros_like(mic)
-                for i in range(0, len(mic), WF):
-                    mic_f = _frame(_to_i16(mic[i:i+WF]))
-                    apm.process_reverse_stream(_frame(_to_i16(ref[i:i+WF])))
-                    apm.process_stream(mic_f)
-                    cleaned[i:i+WF] = (np.frombuffer(bytes(mic_f.data), dtype=np.int16).astype(np.float32) / 32767)[:len(mic[i:i+WF])]
-                return cleaned
-            return process
-        print("  AEC: WebRTC AEC3 (LiveKit APM)")
+    filler_cache = {}
+    if args.filler and kokoro:
+        print("  Pre-computing filler phrases...", flush=True)
+        for phrases in FILLERS.values():
+            for text in phrases:
+                samples, sr = kokoro.create(
+                    text, voice=args.voice, speed=1.0,
+                    lang=_lang_from_voice(args.voice)
+                )
+                filler_cache[text] = (samples, sr)
+
     executor = ThreadPoolExecutor(max_workers=1)
-    # --chime-loop: single buffer (chime + ticks), one sd.play call
-    # --chime only: just the chime
     chime_sound = make_chime() if args.chime else None
     audio_q: queue.Queue[np.ndarray] = queue.Queue()
     record_buf: list[np.ndarray] | None = [] if args.record else None
 
+    vpio_mic = None
+    if args.vpio:
+        try:
+            print("Loading macOS VoiceProcessingIO (AEC + noise suppression)...", flush=True)
+            vpio_mic = VPIOMic(CHUNK_SAMPLES, audio_q, record_buf)
+            print("  VPIO ready", flush=True)
+        except Exception as e:
+            print(f"  VPIO failed: {e} — falling back to sounddevice", file=sys.stderr)
+
+    sd_callback_active = vpio_mic is None
+
     def callback(indata, frames, time, status):
+        if not sd_callback_active:
+            return
+
         if status:
             print(status, file=sys.stderr)
+
         chunk = indata[:, 0].copy()
+
         if record_buf is not None:
             record_buf.append(chunk)
+
         audio_q.put(chunk)
 
     def drain_audio_q():
@@ -308,72 +383,208 @@ def main():
             # In a tick — wait until it ends
             _time.sleep(TICK_DUR - phase + 0.005)
 
-    def play_tts_stream(response):
+    def llm_stream_generate(messages, max_tokens=200, temperature=0.7, **kwargs):
+        """Yield text deltas from the LLM, token by token.
+        Note: stream_generate's result.text is already a delta
+        (the detokenizer tracks offset internally via last_segment)."""
+        prompt = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        for result in stream_generate(
+            model, processor, prompt,
+            max_tokens=max_tokens, temperature=temperature,
+            repetition_penalty=1.2, **kwargs
+        ):
+            text = result.text if hasattr(result, 'text') else str(result)
+            if text:
+                yield text
+
+    def llm_stream_sentences(messages, **kwargs):
+        """Buffer LLM token deltas into complete sentences."""
+        buffer = ''
+        for delta in llm_stream_generate(messages, **kwargs):
+            buffer += delta
+            while True:
+                match = re.search(r'[.!?](?:\s|$)', buffer)
+                if match:
+                    sentence = buffer[:match.end()].strip()
+                    buffer = buffer[match.end():]
+                    if sentence:
+                        yield sentence
+                    continue
+
+                if len(buffer) > 120:
+                    comma = buffer.find(', ', 40)
+                    if comma > 0:
+                        sentence = buffer[:comma + 1].strip()
+                        buffer = buffer[comma + 2:]
+                        if sentence:
+                            yield sentence
+                        continue
+
+                if len(buffer) > 200:
+                    space = buffer.rfind(' ', 40, 200)
+                    if space > 0:
+                        sentence = buffer[:space].strip()
+                        buffer = buffer[space + 1:]
+                        if sentence:
+                            yield sentence
+                        continue
+
+                break
+
+        if buffer.strip():
+            yield buffer.strip()
+
+    def pick_filler(transcript):
+        """Choose an appropriate filler based on the user's utterance."""
+        if not transcript or not filler_cache:
+            return None
+
+        words = transcript.lower().strip().split()
+        if len(words) <= 3:
+            return None
+
+        lower = transcript.lower().strip()
+        if lower.endswith('?') or any(
+            w in lower for w in ('what', 'how', 'why', 'explain', 'tell me')
+        ):
+            choices = FILLERS['thinking']
+        else:
+            choices = FILLERS['acknowledge']
+
+        available = [f for f in choices if f in filler_cache]
+        return random.choice(available) if available else None
+
+    def play_tts_streamed(sentence_q, interrupted_evt, filler_text=None):
+        """TTS worker: play filler, then stream sentences one at a time.
+        Barge-in uses VPIO-cleaned mic audio (echo already removed by OS)
+        so detection is just VAD — no manual reference tracking needed."""
         drain_audio_q()
-        tts_stream = kokoro.create_stream(response, voice=args.voice, speed=1.0, lang=_lang_from_voice(args.voice))
         out_stream, interrupted = None, False
-        tts_16k_buf: list[np.ndarray] = []
-        state = {"play_start": None, "consec_speech": 0, "mic_pos": 0}
-        aec_process = make_aec_processor() if make_aec_processor else None
+        consec_speech = 0
+        play_start = 0.0
 
         def check_barge_in():
-            if not (aec_process and state["play_start"] and tts_16k_buf):
+            nonlocal consec_speech
+            if not vpio_mic or play_start == 0.0:
                 return False
-            if _time.monotonic() - state["play_start"] < 0.5:
+
+            if _time.monotonic() - play_start < 0.5:
                 return False
-            tts_concat = np.concatenate(tts_16k_buf)
+
             while not audio_q.empty():
                 mic_chunk = audio_q.get_nowait()
+
                 if len(mic_chunk) < CHUNK_SAMPLES:
                     continue
-                ref = _get_ref_segment(tts_concat, state["mic_pos"], len(mic_chunk))
-                state["mic_pos"] += len(mic_chunk)
-                cleaned = aec_process(mic_chunk, ref)
-                if _vad_prob(vad, cleaned.astype(np.float32)) > 0.8:
-                    state["consec_speech"] += 1
-                    if state["consec_speech"] >= 5:
+
+                if _vad_prob(vad, mic_chunk.astype(np.float32)) > 0.7:
+                    consec_speech += 1
+
+                    if consec_speech >= 6:
                         return True
                 else:
-                    state["consec_speech"] = 0
+                    consec_speech = 0
+
             return False
 
-        async def _play():
-            nonlocal out_stream, interrupted
-            async for chunk_samples, sr in tts_stream:
-                if out_stream is None:
-                    if chime_sound is not None:
-                        _wait_for_chime_gap()
-                        sd.stop()
-                    out_stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32")
-                    out_stream.start()
-                    drain_audio_q(); vad.reset_states()
-                    state["play_start"] = _time.monotonic()
-                if aec_process is not None:
-                    if sr == SAMPLE_RATE:
-                        tts_16k_buf.append(chunk_samples.astype(np.float32))
-                    else:
-                        idx = np.arange(0, len(chunk_samples), sr / SAMPLE_RATE)
-                        tts_16k_buf.append(np.interp(idx, np.arange(len(chunk_samples)), chunk_samples).astype(np.float32))
-                data = chunk_samples.reshape(-1, 1)
-                for i in range(0, len(data), 4096):
-                    if select.select([sys.stdin], [], [], 0)[0]:
-                        sys.stdin.read(1); interrupted = True
-                    elif check_barge_in():
-                        interrupted = True; print("  [voice interrupt]", flush=True)
-                    if interrupted:
-                        break
-                    out_stream.write(data[i:i+4096])
-                if interrupted:
-                    break
-            if out_stream:
-                out_stream.stop(); out_stream.close()
+        def _start_stream(sr):
+            nonlocal out_stream, play_start
+            if out_stream is not None:
+                return
 
-        asyncio.run(_play())
-        if interrupted and state["consec_speech"] < 3:
-            print("  [interrupted]")
-        drain_audio_q()
-        vad.reset_states()
-        return interrupted
+            if chime_sound is not None:
+                _wait_for_chime_gap()
+                sd.stop()
+
+            out_stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32")
+            out_stream.start()
+            drain_audio_q()
+            vad.reset_states()
+            play_start = _time.monotonic()
+
+        def _write_audio(data, sr):
+            nonlocal interrupted
+            _start_stream(sr)
+            shaped = data.reshape(-1, 1) if data.ndim == 1 else data
+
+            for i in range(0, len(shaped), 4096):
+                chunk = shaped[i:i + 4096]
+
+                if interrupted_evt.is_set():
+                    return True
+
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    sys.stdin.read(1)
+                    interrupted = True
+                    interrupted_evt.set()
+                    return True
+
+                if check_barge_in():
+                    interrupted = True
+                    interrupted_evt.set()
+                    print("  [voice interrupt]", flush=True)
+                    return True
+
+                out_stream.write(chunk)
+
+            return False
+
+        try:
+            if filler_text and filler_text in filler_cache:
+                filler_samples, filler_sr = filler_cache[filler_text]
+
+                if _write_audio(filler_samples, filler_sr):
+                    return
+
+                gap = np.zeros(int(0.15 * filler_sr), dtype=np.float32)
+
+                if _write_audio(gap, filler_sr):
+                    return
+
+            while not interrupted_evt.is_set():
+                try:
+                    sentence = sentence_q.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
+                if sentence is None:
+                    break
+
+                consec_speech = 0
+
+                samples, sr = kokoro.create(
+                    sentence, voice=args.voice, speed=1.0,
+                    lang=_lang_from_voice(args.voice)
+                )
+
+                if _write_audio(samples, sr):
+                    break
+
+                if not interrupted_evt.is_set() and out_stream and args.sentence_gap_ms > 0:
+                    gap_samples = int(args.sentence_gap_ms / 1000 * out_stream.samplerate)
+
+                    if gap_samples > 0:
+                        gap = np.zeros(gap_samples, dtype=np.float32)
+
+                        if _write_audio(gap, int(out_stream.samplerate)):
+                            break
+
+        except Exception as e:
+            print(f"  [TTS error: {e}]", file=sys.stderr)
+            interrupted_evt.set()
+
+        finally:
+            if out_stream:
+                out_stream.stop()
+                out_stream.close()
+
+            if interrupted:
+                print("  [interrupted]")
+
+            drain_audio_q()
+            vad.reset_states()
 
     def process_utterance(audio, history):
         print(f" ({len(audio) / SAMPLE_RATE:.1f}s)")
@@ -381,38 +592,114 @@ def main():
             print("  *chime*", flush=True)
             sd.play(chime_sound, CHIME_SR)
             chime_started_at[0] = _time.monotonic()
+
         wav_path = save_wav(audio) if args.audio_mode else None
+
         try:
             messages = _sys_messages()
             for h in history[-MAX_HISTORY:]:
-                messages += [{"role": "user", "content": h["user"]},
-                             {"role": "assistant", "content": h["assistant"]}]
+                messages += [
+                    {"role": "user", "content": h["user"]},
+                    {"role": "assistant", "content": h["assistant"]},
+                ]
+
             if args.audio_mode:
                 transcribe_future = executor.submit(transcribe, audio)
                 messages.append({"role": "user", "content": [{"type": "audio"}]})
             else:
                 heard = transcribe(audio)
                 print(f"  [{heard}]")
+                if not heard:
+                    return
                 messages.append({"role": "user", "content": heard})
-            response = llm_generate(messages, **({"audio": [wav_path]} if args.audio_mode else {}))
-            if args.audio_mode:
-                heard = transcribe_future.result(timeout=10)
-                print(f"  [{heard}]")
-            print(f"\n> {response}\n", flush=True)
-            if kokoro and response:
-                play_tts_stream(response)
-            elif chime_sound is not None:
-                _wait_for_chime_gap()
-                sd.stop()
+
+            gen_kwargs = {"audio": [wav_path]} if args.audio_mode else {}
+
+            if kokoro:
+                # Pipelined: LLM streams sentences while TTS plays them
+                sentence_q = queue.Queue()
+                interrupted_evt = threading.Event()
+                filler_text = None
+
+                if args.filler and not args.audio_mode:
+                    filler_text = pick_filler(heard)
+
+                tts_thread = threading.Thread(
+                    target=play_tts_streamed,
+                    args=(sentence_q, interrupted_evt, filler_text),
+                    daemon=True,
+                )
+                tts_thread.start()
+
+                if filler_text:
+                    print(f"\n> {filler_text}", flush=True)
+
+                response_parts = []
+                first_output = filler_text is not None
+
+                try:
+                    for sentence in llm_stream_sentences(messages, **gen_kwargs):
+                        if interrupted_evt.is_set():
+                            break
+
+                        response_parts.append(sentence)
+                        sentence_q.put(sentence)
+
+                        if first_output:
+                            print(f"> {sentence}", flush=True)
+                        else:
+                            print(f"\n> {sentence}", flush=True)
+                            first_output = True
+
+                except Exception as e:
+                    print(f"  [stream error: {e}]", file=sys.stderr)
+
+                    if not response_parts:
+                        # Fallback to full generation
+                        response = llm_generate(messages, **gen_kwargs)
+                        response_parts = [response]
+                        sentence_q.put(response)
+                        print(f"\n> {response}", flush=True)
+
+                finally:
+                    sentence_q.put(None)
+
+                tts_thread.join(timeout=30)
+                response = ' '.join(response_parts)
+                print(flush=True)
+
+                if args.audio_mode:
+                    heard = transcribe_future.result(timeout=10)
+                    print(f"  [{heard}]")
+
+            else:
+                # No TTS: sequential generation
+                response = llm_generate(messages, **gen_kwargs)
+
+                if args.audio_mode:
+                    heard = transcribe_future.result(timeout=10)
+                    print(f"  [{heard}]")
+
+                print(f"\n> {response}\n", flush=True)
+
+                if chime_sound is not None:
+                    _wait_for_chime_gap()
+                    sd.stop()
+
             history.append({"user": heard, "assistant": response})
+
             if len(history) > MAX_HISTORY:
                 history.pop(0)
+
             if args.memory:
                 update_memory(heard, response)
+
                 if len(history) % 5 == 0:
                     consolidate_memory()
+
         except Exception as e:
             print(f"\nError: {e}\n", file=sys.stderr)
+
         finally:
             if wav_path:
                 os.unlink(wav_path)
@@ -426,8 +713,9 @@ def main():
     tty.setcbreak(sys.stdin.fileno())
 
     mode = "audio" if args.audio_mode else "text"
-    print(f"\nListening (mode: {mode}, tts: {args.tts}, silence: {args.silence_ms}ms, smart-turn: {args.smart_turn})")
-    tts_hint = (" Speak or press any key to interrupt TTS." if args.aec else " Press any key to interrupt TTS.") if args.tts else ""
+    aec_label = "vpio" if vpio_mic else "off"
+    print(f"\nListening (mode: {mode}, tts: {args.tts}, silence: {args.silence_ms}ms, smart-turn: {args.smart_turn}, aec: {aec_label})")
+    tts_hint = (" Speak or press any key to interrupt TTS." if vpio_mic else " Press any key to interrupt TTS.") if args.tts else ""
     print(f"Speak into your microphone. Ctrl+C to quit.{tts_hint}\n", flush=True)
 
     greeting = llm_generate(_sys_messages() + [
@@ -441,6 +729,9 @@ def main():
     if kokoro:
         speak_tts(greeting)
 
+    if vpio_mic:
+        vpio_mic.start()
+
     with sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1, dtype="float32",
         blocksize=CHUNK_SAMPLES, callback=callback,
@@ -448,27 +739,36 @@ def main():
         try:
             while True:
                 chunk = audio_q.get()
+
                 if len(chunk) < CHUNK_SAMPLES:
                     continue
 
                 speech_prob = _vad_prob(vad, chunk)
+                mic_rms = np.sqrt(np.mean(chunk ** 2))
+
                 if speech_prob > 0.5:
                     if not speaking:
                         speaking = True
-                        print("[listening...]", end="", flush=True)
+                        print(f"[listening rms={mic_rms:.3f}...]", end="", flush=True)
+
                     silent_chunks = 0
                     buf.append(chunk)
+
                 elif speaking:
                     silent_chunks += 1
                     buf.append(chunk)
+
                     if silent_chunks < silence_limit:
                         continue
+
                     if smart_turn and buf:
                         prob = smart_turn(np.concatenate(buf))
                         print(f" [turn prob: {prob:.2f}]", end="", flush=True)
+
                         if prob < 0.5:
                             silent_chunks = 0
                             continue
+
                     process_utterance(np.concatenate(buf), history)
                     buf.clear()
                     speaking, silent_chunks = False, 0
@@ -477,13 +777,22 @@ def main():
         except KeyboardInterrupt:
             print("\nBye!")
             executor.shutdown(wait=False)
+
         finally:
+            if vpio_mic:
+                vpio_mic.stop()
+
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+
             if args.record and record_buf:
                 full = np.concatenate(record_buf)
+
                 with wave.open(args.record, "wb") as wf:
-                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(SAMPLE_RATE)
                     wf.writeframes((full * 32767).clip(-32768, 32767).astype(np.int16).tobytes())
+
                 print(f"Recorded {len(full) / SAMPLE_RATE:.1f}s to {args.record}", flush=True)
 
 

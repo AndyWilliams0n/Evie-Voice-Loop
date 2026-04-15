@@ -18,7 +18,7 @@ uv run evie-mac.py --memory
 uv run evie-mac.py --no-tts
 
 // Disable voice interruption (keypress only)
-uv run evie-mac.py --no-aec
+uv run evie-mac.py --no-vpio
 
 // Disable smart turn detection
 uv run evie-mac.py --no-smart-turn
@@ -56,18 +56,18 @@ Mic (16kHz) --> Silero VAD --> Smart Turn --> Moonshine --> Gemma 4 E4B --> Koko
                                                                 ^                       |
                                                     SOUL.md + MEMORY.md                 |
                                                                                         v
-Mic during TTS --> WebRTC AEC3 (LiveKit APM) --> Silero VAD --> voice interrupt <--------+
+Mic during TTS --> macOS VPIO (AEC + noise suppression) --> Silero VAD --> voice interrupt <--+
 ```
 
 ## How It Works
 
-1. **Mic capture** via sounddevice (16kHz mono)
+1. **Mic capture** via macOS VoiceProcessingIO (AEC + noise suppression built in)
 2. **Silero VAD** detects speech vs silence
 3. **Smart Turn v3** confirms end-of-turn on silence
 4. **Moonshine** transcribes your audio to text (CPU)
 5. **Gemma 4 E4B** responds using SOUL.md (+ MEMORY.md if `--memory`) as system prompt
-6. **Kokoro** synthesises speech and streams audio
-7. **WebRTC AEC3** cleans mic during TTS playback, enabling voice interruption
+6. **Kokoro** synthesises speech and streams sentences in parallel
+7. **VPIO** delivers echo-free mic audio during TTS, enabling voice interruption
 
 ## Tech Stack
 
@@ -78,7 +78,7 @@ Mic during TTS --> WebRTC AEC3 (LiveKit APM) --> Silero VAD --> voice interrupt 
 | [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) | Text-to-speech (streaming) | CPU |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | Voice activity detection | CPU |
 | [Smart Turn v3](https://github.com/pipecat-ai/smart-turn) | End-of-turn detection | CPU |
-| [LiveKit APM](https://github.com/livekit/python-sdks) | WebRTC AEC3 echo cancellation | CPU |
+| macOS VoiceProcessingIO | Hardware AEC + noise suppression | OS kernel |
 | [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) | MLX multimodal inference | MLX / Metal GPU |
 
 ## Persona & Memory
@@ -105,6 +105,6 @@ All models are cached locally after the first download.
 
 ## Credits
 
-Built with open-source tools from Moonshine, Google, Kokoro, Silero, Pipecat, LiveKit, and the MLX community.
+Built with open-source tools from Moonshine, Google, Kokoro, Silero, Pipecat, and the MLX community.
 
 > Need a custom voice model or production voice agent? See [Trelis Voice AI Services](https://trelis.com/voice-ai-services/).
